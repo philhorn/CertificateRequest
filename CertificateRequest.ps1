@@ -29,9 +29,8 @@ $consolePtr = [Console.Window]::GetConsoleWindow()
 
 #region 2. Global Variables
 #INSERT YOUR OWN CA/COMPANY DETAILS HERE
-##############################################
-$yourCA = "yourCA.yourdomain.com\Your Certification Authority"
-$yourDomainSuffix = "yourdomain.com"
+$yourCA = "MyCA.Mydomain.com\My Subordinate Certification Authority"
+$yourDomainSuffix = "mydomain.com"
 # -------------------------
 # Input Fields
 # -------------------------
@@ -39,12 +38,16 @@ $labels = @("Common Name", "SANs", "Point of Contact Email", "Organizational Uni
 $defaults = @{
     "Common Name" = "ServerName"
     "Organizational Unit" = "IT Services"
-    "Organization" = "Organization"
+    "Organization" = "My Organization"
     "Locality" = "City"
     "State" = "State"
     "Country" = "US"
 }
 $textboxes = @{}
+
+
+# Tracks the most recently installed certificate's thumbprint (set during Retrieve-Certificate)
+$script:LastInstalledThumbprint = $null
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 Set-Location $scriptDir
@@ -75,6 +78,60 @@ function Get-CATemplates {
     }
     return $templates
 }
+
+#DER PEM Helpers for RSA key export
+
+function Get-DerLengthBytes {
+    param([int]$len)
+    if ($len -lt 128) { return [byte[]]$len }
+    $bytes = New-Object System.Collections.Generic.List[byte]
+    while ($len -gt 0) { $bytes.Insert(0, $len -band 0xff); $len = $len -shr 8 }
+    ,(0x80 -bor $bytes.Count) + $bytes.ToArray()
+}
+
+function Add-DerInteger {
+    param([System.Collections.Generic.List[byte]]$list, [byte[]]$valueBytes)
+    if (-not $valueBytes) { $valueBytes = [byte[]]@(0x00) }
+    while ($valueBytes.Length -gt 1 -and $valueBytes[0] -eq 0x00 -and ($valueBytes[1] -band 0x80) -eq 0) {
+        $valueBytes = $valueBytes[1..($valueBytes.Length-1)]
+    }
+    if (($valueBytes[0] -band 0x80) -ne 0) { $valueBytes = ,0x00 + $valueBytes }
+    $lenBytes = Get-DerLengthBytes $valueBytes.Length
+    $list.Add(0x02)                                           # INTEGER
+    foreach ($b in $lenBytes)  { $list.Add($b) }
+    foreach ($b in $valueBytes) { $list.Add($b) }
+}
+
+function Write-Pkcs1PemFromRSAParameters {
+    param([System.Security.Cryptography.RSAParameters]$Params, [string]$OutPath)
+    $body = New-Object System.Collections.Generic.List[byte]
+    Add-DerInteger $body ([byte[]]@(0x00))                    # version = 0
+    Add-DerInteger $body $Params.Modulus
+    Add-DerInteger $body $Params.Exponent
+    Add-DerInteger $body $Params.D
+    Add-DerInteger $body $Params.P
+    Add-DerInteger $body $Params.Q
+    Add-DerInteger $body $Params.DP
+    Add-DerInteger $body $Params.DQ
+    Add-DerInteger $body $Params.InverseQ
+
+    $bodyBytes = $body.ToArray()
+    $lenBytes  = Get-DerLengthBytes $bodyBytes.Length
+
+    $seq = New-Object System.Collections.Generic.List[byte]
+    $seq.Add(0x30)                                            # SEQUENCE
+    foreach ($b in $lenBytes)  { $seq.Add($b) }
+    foreach ($b in $bodyBytes) { $seq.Add($b) }
+
+    $der     = $seq.ToArray()
+    $b64     = [System.Convert]::ToBase64String($der)
+    $wrapped = ($b64.ToCharArray() -split "(.{1,64})" | Where-Object { $_ -ne "" }) -join "`r`n"
+    $pem     = "-----BEGIN RSA PRIVATE KEY-----`r`n$wrapped`r`n-----END RSA PRIVATE KEY-----`r`n"
+    $pem | Out-File -FilePath $OutPath -Encoding ascii -Force
+}
+
+
+
 #endregion
 
 #region RSAT Check
@@ -152,25 +209,40 @@ foreach ($labelText in $labels[0..2]) {
 $submitButton = New-Object System.Windows.Forms.Button
 $submitButton.Text = "Generate Request"
 $submitButton.Location = [System.Drawing.Point]::new(10, $nextY)
-$submitButton.Size = [System.Drawing.Size]::new(150, 35)
+$submitButton.Size = [System.Drawing.Size]::new(100, 35)
 $form.Controls.Add($submitButton)
 
 $retrieveButton = New-Object System.Windows.Forms.Button
 $retrieveButton.Text = "Retrieve and Install"
-$retrieveButton.Location = [System.Drawing.Point]::new(170, $nextY)
-$retrieveButton.Size = [System.Drawing.Size]::new(150, 35)
+$retrieveButton.Location = [System.Drawing.Point]::new(120, $nextY)
+$retrieveButton.Size = [System.Drawing.Size]::new(100, 35)
 $form.Controls.Add($retrieveButton)
 
 $exportButton = New-Object System.Windows.Forms.Button
 $exportButton.Text = "Export PFX"
-$exportButton.Location = [System.Drawing.Point]::new(330, $nextY)
-$exportButton.Size = [System.Drawing.Size]::new(150, 35)
+$exportButton.Location = [System.Drawing.Point]::new(230, $nextY)
+$exportButton.Size = [System.Drawing.Size]::new(100, 35)
 $form.Controls.Add($exportButton)
 
+#NewButtons
+$exportCerButton = New-Object System.Windows.Forms.Button
+$exportCerButton.Text = "Export CER"
+$exportCerButton.Location = [System.Drawing.Point]::new(340, $nextY)   # shift cleanup to the right
+$exportCerButton.Size = [System.Drawing.Size]::new(100, 35)
+$form.Controls.Add($exportCerButton)
+
+$exportKeyButton = New-Object System.Windows.Forms.Button
+$exportKeyButton.Text = "Export Key"
+$exportKeyButton.Location = [System.Drawing.Point]::new(450, $nextY)
+$exportKeyButton.Size = [System.Drawing.Size]::new(100, 35)
+$form.Controls.Add($exportKeyButton)
+
+
+#EndNew
 $cleanupButton = New-Object System.Windows.Forms.Button
 $cleanupButton.Text = "Delete .req, .rsp .inf RetrievedCert_*.Cer"
-$cleanupButton.Location = [System.Drawing.Point]::new(490, $nextY)
-$cleanupButton.Size = [System.Drawing.Size]::new(180, 35)
+$cleanupButton.Location = [System.Drawing.Point]::new(560, $nextY)
+$cleanupButton.Size = [System.Drawing.Size]::new(100, 35)
 $form.Controls.Add($cleanupButton)
 
 $nextY += 50
@@ -471,17 +543,52 @@ CertificateTemplate = $template
 #endregion
 
 #region 7. Retrieve and Export Certificate
+
+
 function Retrieve-Certificate($CAConfig, $RequestID) {
     $certPath = Join-Path $scriptDir "RetrievedCert_$RequestID.cer"
     Update-Status "Attempting to retrieve certificate for Request ID: $RequestID"
+
+    # Snapshot pre-install thumbprints
+    $preThumbprints = @(Get-ChildItem Cert:\LocalMachine\My | Select-Object -ExpandProperty Thumbprint)
+
     $output = certreq -retrieve -f -config "$CAConfig" $RequestID $certPath 2>&1
     if (-not (Test-Path $certPath)) {
         Update-Status "ERROR: Certificate file not created. Output:`n$output" $true
         return $false
     }
+
     $acceptOutput = certreq -accept -f -machine $certPath 2>&1
     if ($LASTEXITCODE -eq 0) {
         Update-Status "Certificate retrieved and installed successfully."
+
+        # Diff post-install to find the new thumbprint
+        $postThumbprints = @(Get-ChildItem Cert:\LocalMachine\My | Select-Object -ExpandProperty Thumbprint)
+        $newThumb = ($postThumbprints | Where-Object { $_ -notin $preThumbprints } | Select-Object -First 1)
+
+        if ($newThumb) {
+            $script:LastInstalledThumbprint = $newThumb
+            Update-Status "Newly installed certificate thumbprint: $newThumb"
+
+            # OPTIONAL: append thumbprint to RequestLog.txt for this RequestID
+            $logFile = Join-Path $scriptDir "RequestLog.txt"
+            if (Test-Path $logFile) {
+                $lines = Get-Content $logFile
+                $updated = $false
+                for ($i = 0; $i -lt $lines.Count; $i++) {
+                    if ($lines[$i] -match "^\s*$RequestID,") {
+                        if ($lines[$i] -notmatch ",[0-9A-F]{40}$") {
+                            $lines[$i] = $lines[$i] + "," + $newThumb
+                            $updated = $true
+                        }
+                        break
+                    }
+                }
+                if ($updated) { $lines | Set-Content $logFile }
+            }
+        } else {
+            Update-Status "WARNING: Could not determine new thumbprint (CN collision or pre-existing match)." $true
+        }
         return $true
     } else {
         Update-Status "ERROR during accept:`n$acceptOutput" $true
@@ -590,6 +697,130 @@ if ($passwordForm.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
 
 
 
+function Export-Cer {
+    param(
+        [Parameter(Mandatory=$true)] [string] $CN,
+        [Parameter(Mandatory=$false)] [string] $RequestID
+    )
+    $safeCN = ($CN -replace '[^a-zA-Z0-9.\-]', '_')
+    $cerName = if ($RequestID -and $RequestID.Trim()) { "Cer_${safeCN}-${RequestID}.cer" } else { "Cer_${safeCN}-unknownReqID.cer" }
+    $cerPath = Join-Path $scriptDir $cerName
+
+    # Prefer last installed thumbprint; fall back to CN match
+    $cert = $null
+    if ($script:LastInstalledThumbprint) {
+        $cert = Get-ChildItem "Cert:\LocalMachine\My\$script:LastInstalledThumbprint" -ErrorAction SilentlyContinue
+    }
+    if (-not $cert) {
+        $matches = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -like "*$CN*" }
+        if (-not $matches -or $matches.Count -eq 0) {
+            Update-Status "ERROR: No certificate found matching CN '$CN' in LocalMachine\My store." $true
+            return
+        }
+        # pick newest as a stable heuristic
+        $cert = ($matches | Sort-Object NotBefore -Descending | Select-Object -First 1)
+    }
+
+    Update-Status "Exporting CER for Subject: $($cert.Subject) | Thumbprint: $($cert.Thumbprint)"
+    try {
+        Export-Certificate -Cert $cert -FilePath $cerPath -Force | Out-Null
+        Update-Status "CER exported successfully to $cerPath"
+    } catch {
+        Update-Status "ERROR during CER export: $($_.Exception.Message)" $true
+    }
+}
+
+
+
+
+
+
+function Export-PrivateKey {
+    param(
+        [Parameter(Mandatory=$true)] [string] $CN,
+        [Parameter(Mandatory=$false)] [string] $RequestID
+    )
+
+    # Prefer the cert we just accepted via thumbprint
+    $cert = $null
+    if ($script:LastInstalledThumbprint) {
+        $cert = Get-ChildItem "Cert:\LocalMachine\My\$script:LastInstalledThumbprint" -ErrorAction SilentlyContinue
+        if ($cert) { Update-Status "Using last installed cert thumbprint: $($script:LastInstalledThumbprint)" }
+    }
+    if (-not $cert) {
+        # Fallback: CN match (newest)
+        $matches = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -like "*CN=$CN*" -or $_.Subject -like "*$CN*" }
+        if (-not $matches -or $matches.Count -eq 0) {
+            Update-Status "ERROR: No certificate found matching CN '$CN' in LocalMachine\My." $true
+            return
+        }
+        $cert = ($matches | Sort-Object NotBefore -Descending | Select-Object -First 1)
+        Update-Status "Selected by CN. Subject: $($cert.Subject) | Thumbprint: $($cert.Thumbprint)"
+    }
+
+    if (-not $cert.HasPrivateKey) {
+        Update-Status "ERROR: The selected certificate does not have a linked private key." $true
+        return
+    }
+
+    # File naming
+    $safeCN  = ($CN -replace '[^a-zA-Z0-9.\-]', '_')
+    $label   = if ($RequestID -and $RequestID.Trim()) { "${safeCN}-${RequestID}" } else { "${safeCN}-unknownReqID" }
+    $pkcs8Path = Join-Path $scriptDir ("PrivateKey_{0}.pem" -f $label)
+    $pkcs1Path = Join-Path $scriptDir ("PrivateKey_{0}.key" -f $label)
+
+    # Try CNG path you used (PKCS#8 PEM)
+    try {
+        $rsaCng = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+        if ($rsaCng -and ($rsaCng.PSObject.Properties.Name -contains 'Key') -and $rsaCng.Key) {
+            # Export as PKCS#8 blob
+            $bytes = $rsaCng.Key.Export([System.Security.Cryptography.CngKeyBlobFormat]::Pkcs8PrivateBlob)
+            $b64   = [System.Convert]::ToBase64String($bytes, [System.Base64FormattingOptions]::InsertLineBreaks)
+            $pem   = @"
+-----BEGIN PRIVATE KEY-----
+$b64
+-----END PRIVATE KEY-----
+"@
+            $pem | Out-File -FilePath $pkcs8Path -Encoding ascii -Force
+            Update-Status "Private key exported (PKCS#8, CNG) to $pkcs8Path"
+            return
+        }
+    } catch {
+        Update-Status "INFO: CNG PKCS#8 export not available, trying RSA CSP fallback (PKCS#1)." # not an error; we'll fall back
+    }
+
+    # Fallback: CSP RSA (PKCS#1 via RSAParameters)
+    try {
+        # Get RSA handle via PrivateKey or RSACertificateExtensions
+        $rsa = $null
+        try { $rsa = $cert.PrivateKey } catch { $rsa = $null }
+        if (-not $rsa -or -not ($rsa -is [System.Security.Cryptography.RSA])) {
+            try { $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert) } catch { $rsa = $null }
+        }
+        if (-not $rsa -or -not ($rsa -is [System.Security.Cryptography.RSA])) {
+            Update-Status "ERROR: Could not obtain an RSA private key handle for fallback export." $true
+            return
+        }
+
+        # Ensure exportable for CSP
+        if ($rsa -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
+            $csp = [System.Security.Cryptography.RSACryptoServiceProvider]$rsa
+            if (-not $csp.CspKeyContainerInfo.Exportable) {
+                Update-Status "ERROR: Private key marked non-exportable by provider (CSP). Ensure the new cert was created with Exportable=TRUE and you're targeting it by thumbprint." $true
+                return
+            }
+        }
+
+        $params = $rsa.ExportParameters($true)
+        Write-Pkcs1PemFromRSAParameters -Params $params -OutPath $pkcs1Path
+        Update-Status "Private key exported (PKCS#1, CSP) to $pkcs1Path"
+    } catch {
+        Update-Status "ERROR exporting private key: $($_.Exception.Message)" $true
+    }
+}
+
+
+
 #endregion
 
 #region 8. Event Handlers
@@ -650,6 +881,57 @@ $exportButton.Add_Click({
 })
 
 
+$exportCerButton.Add_Click({
+    $cn = $textboxes["Common Name"].Text
+    $requestId = $requestIdBox.Text.Trim()
+
+    if (-not $cn) {
+        Update-Status "ERROR: Common Name is required for CER export." $true
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($requestId)) {
+        Update-Status "WARNING: Request ID is blank. CER will use 'unknownReqID' in filename." $true
+    } else {
+        Update-Status "Exporting CER for CN '$cn' with Request ID '$requestId'..."
+    }
+    Export-Cer -CN $cn -RequestID $requestId
+})
+
+$exportKeyButton.Add_Click({
+    $cn = $textboxes["Common Name"].Text
+    $requestId = $requestIdBox.Text.Trim()
+
+    if (-not $cn) {
+        Update-Status "ERROR: Common Name is required for Private Key export." $true
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($requestId)) {
+        Update-Status "WARNING: Request ID is blank. Key export will use 'unknownReqID' in filename." $true
+    } else {
+        Update-Status "Exporting Private Key for CN '$cn' with Request ID '$requestId'..."
+    }
+
+    # Default PKCS#1; change to 'PKCS8' if desired or add a small dropdown/toggle
+    Export-PrivateKey -CN $cn -RequestID $requestId -Format 'PKCS1'
+})
+
+$exportKeyButton.Add_Click({
+    $cn = $textboxes["Common Name"].Text
+    $requestId = $requestIdBox.Text.Trim()
+
+    if (-not $cn) {
+        Update-Status "ERROR: Common Name is required for Private Key export." $true
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($requestId)) {
+        Update-Status "WARNING: Request ID is blank. Key export will use 'unknownReqID' in filename." $true
+    } else {
+        Update-Status "Exporting Private Key for CN '$cn' with Request ID '$requestId'..."
+    }
+    Export-PrivateKey -CN $cn -RequestID $requestId
+})
+
+
 $approveButton.Add_Click({
     $requestId = $requestIdBox.Text.Trim()
     if (-not $requestId) {
@@ -687,5 +969,3 @@ $form.Add_FormClosing({
 $form.Add_Shown({ $form.Activate() })
 [void]$form.ShowDialog()
 #endregion
-
-
