@@ -1,0 +1,114 @@
+#Sample CSV DATA:(remove the #)
+#Floor,Description,Manufacturer,Model,SerialNumber,MAC Address,Current IP,Interface,ClientId,Current IP,Interface,Duplicate,Port,Switch IP
+#19,Describe or Name of device,Aruba,6300CX,ATBG00380,00:60:00:00:e0:7e,,,00:60:00:00:00:7e,,,No,5/1/2,10.0.0.191
+#19,Describe or name this device,Netgear,NetgearModelNumber,ADRSSIRR0034,00:00:00:60:0e:49,10.0.0.149,ae1.90,00:0e:00:00:00:49,10.0.0.149,ae1.90,No,5/1/6,10.0.0.191
+
+
+import csv
+import paramiko
+import getpass
+import logging
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
+# Prompt for SSH credentials
+username = input("Enter SSH username: ")
+password = getpass.getpass("Enter SSH password: ")
+
+# Define global commands to be sent to all switches
+global_commands = [
+    "conf t",
+    "aruba-central support-mode",
+    "qos trust dscp",
+    "interface lag 1",
+    "qos trust dscp"
+]
+
+# Read the CSV file and group ports and descriptions by switch IP
+port_map = defaultdict(list)
+input_file = 'QOS-Ports.csv'
+
+with open(input_file, 'r') as file:
+    reader = csv.DictReader(file)
+    for row in reader:
+        switch_ip = row['Switch IP']
+        port = row['Port']
+        description = row.get('Description', 'Configured by automation script')
+        if switch_ip != 'Not Found' and port != 'Not Found':
+            port_map[switch_ip].append((port, description))
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+
+# Generate a single timestamp for all files
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# Function to configure a single switch
+def configure_switch(switch_ip, port_data):
+    log_filename = f"{switch_ip.replace('.', '_')}_config.log"
+    grouped_file = f"{switch_ip.replace('.', '_')}_grouped_{timestamp}.csv"
+    pre_config_file = f"{switch_ip.replace('.', '_')}_pre_config_{timestamp}.txt"
+    post_config_file = f"{switch_ip.replace('.', '_')}_post_config_{timestamp}.txt"
+
+    logger = logging.getLogger(switch_ip)
+    handler = logging.FileHandler(log_filename)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+    try:
+        logger.info(f"Connecting to {switch_ip}")
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(switch_ip, username=username, password=password)
+        shell = ssh.invoke_shell()
+
+        with open(grouped_file, 'w', newline='') as grouped_csv, \
+             open(pre_config_file, 'a') as pre_file, \
+             open(post_config_file, 'a') as post_file:
+
+            csv_writer = csv.writer(grouped_csv)
+            csv_writer.writerow(['Switch IP', 'Port', 'Description', 'QoS'])
+
+            for port, description in port_data:
+                # Pre-configuration capture
+                cmd = f"show run interface {port}"
+                stdin, stdout, stderr = ssh.exec_command(cmd)
+                pre_output = stdout.read().decode()
+                pre_file.write(f"\n--- {timestamp} ---\n")
+                pre_file.write(f"Pre-configuration for {port}:\n{pre_output}\n")
+
+            # Send global commands
+            for cmd in global_commands:
+                shell.send(cmd + '\n')
+
+            # Send port-specific commands and write to grouped CSV
+            for port, description in port_data:
+                shell.send(f"interface {port}\n")
+                shell.send(f"description {description}\n")
+                shell.send("qos trust dscp\n")
+                csv_writer.writerow([switch_ip, port, description, "qos trust dscp"])
+
+            shell.send("end\n")
+            shell.send("write memory\n")
+
+            for port, _ in port_data:
+                # Post-configuration capture
+                cmd = f"show run interface {port}"
+                stdin, stdout, stderr = ssh.exec_command(cmd)
+                post_output = stdout.read().decode()
+                post_file.write(f"\n--- {timestamp} ---\n")
+                post_file.write(f"Post-configuration for {port}:\n{post_output}\n")
+
+        logger.info(f"Configuration applied to {switch_ip}")
+        ssh.close()
+    except Exception as e:
+        logger.error(f"Error configuring {switch_ip}: {e}")
+
+# Execute configuration in parallel
+with ThreadPoolExecutor(max_workers=5) as executor:
+    for switch_ip, port_data in port_map.items():
+        executor.submit(configure_switch, switch_ip, port_data)
+
+print("✅ Parallel configuration script completed. Check individual log files and output files for details.")
+
